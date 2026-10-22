@@ -1,24 +1,22 @@
-FROM node:20-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# tmate और जरूरी सिस्टम टूल्स इंस्टॉल करना ताकि VPS/tmate कमांड चल सकें
+# सिस्टम टूल्स और tmate इंस्टॉल करना ताकि वीपीएस और tmate कमांड सही से काम कर सकें
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       tmate \
-      curl \
       git \
+      curl \
       procps \
       && rm -rf /var/lib/apt/lists/*
 
-# डिपेंडेंसी इंस्टॉल करना
-COPY package*.json ./
-RUN npm install
+# पाइथन डिपेंडेंसी इंस्टॉल करना
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# बाकी बोट की फाइलें कॉपी करना
+# बोट की बाकी सभी फाइलें कॉपी करना
 COPY . .
 
-EXPOSE 10000
-
-# बोट को स्टार्ट करना
-CMD ["npm", "start"]
+# बोट को शुरू करने की कमांड
+CMD ["python3", "bot.py"]
