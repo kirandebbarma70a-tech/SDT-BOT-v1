@@ -115,7 +115,7 @@ def get_normalized_os(os_input: str) -> tuple:
     raise ValueError(f"Unsupported OS version: `{os_input}`. Supported: Ubuntu 20.04/22.04, Debian 10/11/12/13.")
 
 # ---------------------------------------------------------
-# RELIABLE CONTAINER PROVISIONING ENGINE
+# RELIABLE CONTAINER PROVISIONING ENGINE (TMATE VERSION)
 # ---------------------------------------------------------
 def _provision_vps_sync(image_tag: str, ram_bytes: int, cpu_cores: int, disk_bytes: int, container_name: str, root_password: str):
     data_dir = os.path.abspath(config.get("DEFAULT_DATA_DIR", "./vps_data"))
@@ -129,16 +129,24 @@ def _provision_vps_sync(image_tag: str, ram_bytes: int, cpu_cores: int, disk_byt
         logging.info(f"Image {image_tag} not found locally. Pulling from Docker Hub...")
         docker_client.images.pull(image_tag)
 
-    try:
-        docker_client.images.get("tailscale/tailscale:latest")
-    except docker.errors.ImageNotFound:
-        docker_client.images.pull("tailscale/tailscale:latest")
+    # Startup script to install openssh-server and tmate inside the container
+    startup_script = (
+        "apt-get update && "
+        "apt-get install -y openssh-server tmate procps && "
+        "mkdir -p /var/run/sshd && "
+        f"echo 'root:{root_password}' | chpasswd && "
+        "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config && "
+        "/usr/sbin/sshd && "
+        "tmate -S /tmp/tmate.sock new-session -d && "
+        "tmate -S /tmp/tmate.sock wait tmate-ready && "
+        "sleep infinity"
+    )
 
-    # Launch main OS container with OpenSSH Server
+    # Launch main OS container with hard limits & tmate setup
     container = docker_client.containers.run(
         image=image_tag,
         name=container_name,
-        command="bash -c 'apt-get update && apt-get install -y openssh-server && mkdir -p /var/run/sshd && echo \"root:" + root_password + "\" | chpasswd && sed -i \"s/#PermitRootLogin.*/PermitRootLogin yes/g\" /etc/ssh/sshd_config && /usr/sbin/sshd -D'",
+        command=f"bash -c \"{startup_script}\"",
         detach=True,
         tty=True,
         stdin_open=True,
@@ -148,57 +156,33 @@ def _provision_vps_sync(image_tag: str, ram_bytes: int, cpu_cores: int, disk_byt
         privileged=True
     )
 
-    ts_container_name = f"ts-{container_name}"
-    clean_hostname = container_name.replace("_", "-")
-    
-    # Launch Tailscale container sharing the OS container network
-    ts_container = docker_client.containers.run(
-        image="tailscale/tailscale:latest",
-        name=ts_container_name,
-        environment={
-            "TS_HOSTNAME": clean_hostname,
-            "TS_USERSPACE": "true"
-        },
-        network_mode=f"container:{container.id}",
-        detach=True,
-        privileged=True
-    )
+    # Capture tmate SSH and Web URLs via docker exec
+    tmate_ssh_url = None
+    tmate_web_url = None
 
-    # Allow tailscaled to initialize
-    time.sleep(3)
-
-    # Force Tailscale to generate the authentication URL directly via exec
-    auth_url = None
-    for _ in range(10):
+    for _ in range(15):
         try:
-            exec_res = ts_container.exec_run("tailscale up --qr=false")
-            output = exec_res.output.decode("utf-8", errors="ignore")
-            
-            # Extract only the login URL endpoint
-            match = re.search(r"https://login\.tailscale\.com/a/[a-zA-Z0-9]+", output)
-            if match:
-                auth_url = match.group(0)
-                break
+            exec_ssh = container.exec_run("tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'")
+            ssh_out = exec_ssh.output.decode("utf-8", errors="ignore").strip()
 
-            # Fallback to checking logs directly if exec output returned nothing
-            logs = ts_container.logs().decode("utf-8", errors="ignore")
-            match_logs = re.search(r"https://login\.tailscale\.com/a/[a-zA-Z0-9]+", logs)
-            if match_logs:
-                auth_url = match_logs.group(0)
+            exec_web = container.exec_run("tmate -S /tmp/tmate.sock display -p '#{tmate_web}'")
+            web_out = exec_web.output.decode("utf-8", errors="ignore").strip()
+
+            if ssh_out and "ssh" in ssh_out:
+                tmate_ssh_url = ssh_out
+                tmate_web_url = web_out
                 break
         except Exception as e:
-            logging.warning(f"Tailscale link fetch attempt error: {e}")
+            logging.warning(f"tmate link fetch attempt error: {e}")
             
         time.sleep(2)
 
-    if not auth_url:
+    if not tmate_ssh_url:
         container.stop()
         container.remove()
-        ts_container.stop()
-        ts_container.remove()
-        raise RuntimeError("Failed to capture Tailscale Auth URL. Please verify container network access.")
+        raise RuntimeError("Failed to capture tmate connection link. Please verify container network access.")
 
-    return container, auth_url
+    return container, tmate_ssh_url, tmate_web_url
 
 async def provision_vps(image_tag: str, ram_bytes: int, cpu_cores: int, disk_bytes: int, container_name: str, root_password: str):
     return await asyncio.to_thread(_provision_vps_sync, image_tag, ram_bytes, cpu_cores, disk_bytes, container_name, root_password)
@@ -244,24 +228,24 @@ async def cmd_create(ctx, ram: str, cpu: int, disk: str, os_type: str, user: dis
         await ctx.send(f"❌ **Parameter Error:** {e}")
         return
 
-    status_msg = await ctx.send(f"⏳ **[1/2]** Provisioning VPS ({ram} RAM, {cpu} Core(s)) for {user.mention}...")
+    status_msg = await ctx.send(f"⏳ **[1/2]** Provisioning VPS with tmate ({ram} RAM, {cpu} Core(s)) for {user.mention}...")
     
     container_name = f"vps-{user.id}-{int(time.time())}"
     root_password = generate_password()
 
     try:
-        container, login_url = await asyncio.wait_for(
+        container, tmate_ssh, tmate_web = await asyncio.wait_for(
             provision_vps(image_tag, ram_bytes, cpu, disk_bytes, container_name, root_password),
             timeout=90.0
         )
 
-        await status_msg.edit(content=f"⏳ **[2/2]** Delivering Tailscale access link to {user.mention} via DM...")
+        await status_msg.edit(content=f"⏳ **[2/2]** Delivering tmate access details to {user.mention} via DM...")
 
         vps_id = container.id[:10]
 
         dm_embed = discord.Embed(
-            title="🚀 Your VPS is Ready!",
-            description="Click the link below to authorize this instance and attach it to your Tailscale network.",
+            title="🚀 Your VPS is Ready (via tmate)!",
+            description="Use the details below to access your terminal instantly without any extra app setup.",
             color=discord.Color.blue()
         )
         dm_embed.add_field(name="Instance ID", value=f"`{vps_id}`", inline=True)
@@ -269,8 +253,12 @@ async def cmd_create(ctx, ram: str, cpu: int, disk: str, os_type: str, user: dis
         dm_embed.add_field(name="Allocated vCPU", value=f"`{cpu} Core(s)`", inline=True)
         dm_embed.add_field(name="Disk Storage", value=f"`{disk}`", inline=True)
         dm_embed.add_field(name="OS Distribution", value=f"`{os_key}`", inline=True)
-        dm_embed.add_field(name="🔑 Tailscale Login Link", value=f"{login_url}", inline=False)
-        dm_embed.add_field(name="🔐 SSH Credentials", value=f"**Port:** `22`\n**User:** `root`\n**Password:** `{root_password}`", inline=False)
+        
+        dm_embed.add_field(name="🔗 Direct SSH Command (tmate)", value=f"```bash\n{tmate_ssh}\n```", inline=False)
+        if tmate_web:
+            dm_embed.add_field(name="🌐 Web Terminal Link", value=f"{tmate_web}", inline=False)
+            
+        dm_embed.add_field(name="🔐 Local Root Credentials", value=f"**User:** `root`\n**Password:** `{root_password}`", inline=False)
 
         try:
             await user.send(embed=dm_embed)
@@ -296,7 +284,7 @@ async def cmd_create(ctx, ram: str, cpu: int, disk: str, os_type: str, user: dis
         }
         save_db(db)
 
-        await status_msg.edit(content=f"✅ **VPS Provisioned Successfully!**\n**ID:** `{vps_id}`\n**Assigned To:** {user.mention}\n📩 **Login link delivered to Direct Messages.**")
+        await status_msg.edit(content=f"✅ **VPS Provisioned Successfully with tmate!**\n**ID:** `{vps_id}`\n**Assigned To:** {user.mention}\n📩 **Access details delivered to Direct Messages.**")
 
     except Exception as err:
         logging.error(f"Error provisioning VPS: {err}", exc_info=True)
@@ -304,4 +292,3 @@ async def cmd_create(ctx, ram: str, cpu: int, disk: str, os_type: str, user: dis
 
 if __name__ == "__main__":
     bot.run(config.get("TOKEN"))
-  
